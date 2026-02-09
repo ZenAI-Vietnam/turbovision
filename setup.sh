@@ -4,4 +4,4 @@ uv venv --python 3.10 --clear
 source .venv/bin/activate
 uv pip install pip
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-uv pip install ultralytics roboflow ipykernel
+uv pip install ultralytics roboflow ipykernel supervision

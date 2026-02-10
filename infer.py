@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 from typing import Iterator, List, Tuple
 
 import cv2
@@ -10,40 +11,19 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from sports.common.team import TeamClassifier
-from sports.configs.soccer import SoccerPitchConfiguration
 
 
-PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PLAYER_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, "data/football-player-detection.pt")
-PITCH_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, "data/football-pitch-detection.pt")
+PLAYER_DETECTION_MODEL_PATH = "football-players-detection/yolo26m.pt_50_1280_new/weights/best.pt"
+PITCH_DETECTION_MODEL_PATH = "football-pitch-detection/yolo26x-pose.pt_100_640/weights/best.pt"
+BALL_CLASS_ID = 0
+GOALKEEPER_CLASS_ID = 1
+PLAYER_CLASS_ID = 2
+REFEREE_CLASS_ID = 3
 
-# Original class ids from the detector
-BALL_CLASS_ID = 0          # Person.BALL
-GOALKEEPER_CLASS_ID = 1    # Person.GOALIE
-PLAYER_CLASS_ID = 2        # Person.PLAYER
-REFEREE_CLASS_ID = 3       # Person.REFEREE
-
-# New virtual classes for teams
-TEAM_1_CLASS_ID = 6        # "team 1"
-TEAM_2_CLASS_ID = 7        # "team 2"
+TEAM_1_CLASS_ID = 6
+TEAM_2_CLASS_ID = 7
 
 STRIDE = 60
-CONFIG = SoccerPitchConfiguration()
-
-COLORS = ["#FF1493", "#00BFFF", "#FF6347", "#FFD700"]
-
-ELLIPSE_ANNOTATOR = sv.EllipseAnnotator(
-    color=sv.ColorPalette.from_hex(COLORS),
-    thickness=2,
-)
-
-ELLIPSE_LABEL_ANNOTATOR = sv.LabelAnnotator(
-    color=sv.ColorPalette.from_hex(COLORS),
-    text_color=sv.Color.from_hex("#FFFFFF"),
-    text_padding=5,
-    text_thickness=1,
-    text_position=sv.Position.BOTTOM_CENTER,
-)
 
 
 class BoundingBox(BaseModel):
@@ -65,121 +45,169 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
 
-def _prepare_team_classifier(
-    source_video_path: str,
-    device: str,
-) -> TeamClassifier | None:
-    """
-    Helper to collect crops and fit TeamClassifier from a video.
-    """
-    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
-
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path,
-        stride=STRIDE,
-    )
-
-    crops: List[np.ndarray] = []
-    for frame in tqdm(frame_generator, desc="collecting crops for team classifier"):
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
-        players = detections[detections.class_id == PLAYER_CLASS_ID]
-        if len(players) == 0:
-            continue
-        crops += get_crops(frame, players)
-
-    if len(crops) == 0:
-        return None
-
-    team_classifier = TeamClassifier(device=device)
-    team_classifier.fit(crops)
-    return team_classifier
-
-
 def run_infer_results(
     source_video_path: str,
     device: str = "cpu",
-) -> Iterator[TVFrameResult]:
-    """
-    Generator: infer on video and yield TVFrameResult for each frame.
-    - Bounding boxes: BALL(0), GOALIE(1), REFEREE(3), TEAM_1(6), TEAM_2(7)
-    - Keypoints: list of (x, y) from pitch keypoints.
-    """
+) -> List[TVFrameResult]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
 
-    team_classifier = _prepare_team_classifier(
-        source_video_path=source_video_path,
-        device=device,
-    )
-
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
 
-    frame_id = 0
-    for frame in frame_generator:
-        # Pitch keypoints
+    all_player_crops: List[np.ndarray] = []
+    per_frame_data: List[dict] = []
+
+    t_pass1_start = time.perf_counter()
+    for frame in tqdm(frame_generator, desc="Pass 1: detect & collect crops"):
         pitch_result = pitch_detection_model(frame, verbose=False)[0]
         keypoints_sv = sv.KeyPoints.from_ultralytics(pitch_result)
 
-        # Person detections
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
-        detections = tracker.update_with_detections(detections)
 
-        # Split by base classes
         balls = detections[detections.class_id == BALL_CLASS_ID]
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
-        # Team classification for players -> CLASS_ID 6 / 7
-        if len(players) > 0 and team_classifier is not None:
-            player_crops = get_crops(frame, players)
-            players_team_id = team_classifier.predict(player_crops)  # 0 or 1
+        if len(players) > 0:
+            crops = get_crops(frame, players)
+            start_idx = len(all_player_crops)
+            all_player_crops.extend(crops)
+            global_indices = list(range(start_idx, start_idx + len(crops)))
+        else:
+            global_indices = []
 
-            mapped_class_ids = np.where(
-                players_team_id == 0,
-                TEAM_1_CLASS_ID,
-                TEAM_2_CLASS_ID,
-            )
-            players.class_id = mapped_class_ids  # type: ignore[assignment]
+        frame_info: dict = {
+            "balls_xyxy": balls.xyxy.copy() if len(balls) > 0 else np.zeros((0, 4), dtype=float),
+            "balls_conf": balls.confidence.copy() if len(balls) > 0 else np.zeros((0,), dtype=float),
+            "goalkeepers_xyxy": goalkeepers.xyxy.copy() if len(goalkeepers) > 0 else np.zeros((0, 4), dtype=float),
+            "goalkeepers_conf": goalkeepers.confidence.copy() if len(goalkeepers) > 0 else np.zeros((0,), dtype=float),
+            "players_xyxy": players.xyxy.copy() if len(players) > 0 else np.zeros((0, 4), dtype=float),
+            "players_conf": players.confidence.copy() if len(players) > 0 else np.zeros((0,), dtype=float),
+            "players_global_idx": np.array(global_indices, dtype=int),
+            "referees_xyxy": referees.xyxy.copy() if len(referees) > 0 else np.zeros((0, 4), dtype=float),
+            "referees_conf": referees.confidence.copy() if len(referees) > 0 else np.zeros((0,), dtype=float),
+            "keypoints": [],
+        }
 
-        # Merge detections
-        merged = sv.Detections.merge([balls, goalkeepers, players, referees])
+        if keypoints_sv.xy is not None and len(keypoints_sv.xy) > 0:
+            pts = keypoints_sv.xy[0]
+            confs = keypoints_sv.confidence[0]
+            for pt, conf in zip(pts, confs):
+                x, y = pt
+                if x > 0 and y > 0 and conf > 0.3 and x < frame.shape[1] and y < frame.shape[0]:
+                    frame_info["keypoints"].append((int(x), int(y)))
 
+        per_frame_data.append(frame_info)
+
+    t_pass1 = time.perf_counter() - t_pass1_start
+    print(f"[infer] pass1_detect_collect: {t_pass1:.3f}s")
+
+    players_team_id_all: np.ndarray | None = None
+    if len(all_player_crops) > 0:
+        team_classifier = TeamClassifier(device=device, batch_size=128)
+        t_fit_start = time.perf_counter()
+        players_team_id_all = team_classifier.fit_predict(all_player_crops)
+        t_fit = time.perf_counter() - t_fit_start
+        print(f"[infer] fit_and_predict_team: {t_fit:.3f}s")
+
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    frame_id = 0
+    t_pass2_start = time.perf_counter()
+    results: List[TVFrameResult] = []
+    for frame, frame_info in zip(frame_generator, per_frame_data):
         boxes: list[BoundingBox] = []
-        if len(merged) > 0:
-            xyxy = merged.xyxy
-            class_ids = merged.class_id
-            confidences = merged.confidence
-            for i in range(len(merged)):
-                x1, y1, x2, y2 = xyxy[i]
+
+        # Balls
+        balls_xyxy = frame_info["balls_xyxy"]
+        balls_conf = frame_info["balls_conf"]
+        for i in range(len(balls_xyxy)):
+            x1, y1, x2, y2 = balls_xyxy[i]
+            boxes.append(
+                BoundingBox(
+                    x1=int(x1),
+                    y1=int(y1),
+                    x2=int(x2),
+                    y2=int(y2),
+                    cls_id=BALL_CLASS_ID,
+                    conf=float(balls_conf[i]),
+                )
+            )
+
+        # Goalkeepers
+        gk_xyxy = frame_info["goalkeepers_xyxy"]
+        gk_conf = frame_info["goalkeepers_conf"]
+        for i in range(len(gk_xyxy)):
+            x1, y1, x2, y2 = gk_xyxy[i]
+            boxes.append(
+                BoundingBox(
+                    x1=int(x1),
+                    y1=int(y1),
+                    x2=int(x2),
+                    y2=int(y2),
+                    cls_id=GOALKEEPER_CLASS_ID,
+                    conf=float(gk_conf[i]),
+                )
+            )
+
+        # Referees
+        ref_xyxy = frame_info["referees_xyxy"]
+        ref_conf = frame_info["referees_conf"]
+        for i in range(len(ref_xyxy)):
+            x1, y1, x2, y2 = ref_xyxy[i]
+            boxes.append(
+                BoundingBox(
+                    x1=int(x1),
+                    y1=int(y1),
+                    x2=int(x2),
+                    y2=int(y2),
+                    cls_id=REFEREE_CLASS_ID,
+                    conf=float(ref_conf[i]),
+                )
+            )
+
+        pl_xyxy = frame_info["players_xyxy"]
+        pl_conf = frame_info["players_conf"]
+        pl_idx = frame_info["players_global_idx"]
+
+        if len(pl_xyxy) > 0:
+            if players_team_id_all is not None:
+                players_team_id = players_team_id_all[pl_idx]
+                mapped_class_ids = np.where(
+                    players_team_id == 0,
+                    TEAM_1_CLASS_ID,
+                    TEAM_2_CLASS_ID,
+                )
+            else:
+                mapped_class_ids = np.full(len(pl_xyxy), PLAYER_CLASS_ID, dtype=int)
+
+            for i in range(len(pl_xyxy)):
+                x1, y1, x2, y2 = pl_xyxy[i]
                 boxes.append(
                     BoundingBox(
                         x1=int(x1),
                         y1=int(y1),
                         x2=int(x2),
                         y2=int(y2),
-                        cls_id=int(class_ids[i]),
-                        conf=float(confidences[i]),
+                        cls_id=int(mapped_class_ids[i]),
+                        conf=float(pl_conf[i]),
                     )
                 )
 
-        # Keypoints: flatten first frame of keypoints, filter valid ones
-        kpts: list[Tuple[int, int]] = []
-        if keypoints_sv.xy is not None and len(keypoints_sv.xy) > 0:
-            pts = keypoints_sv.xy[0]
-            for x, y in pts:
-                if x > 1 and y > 1:
-                    kpts.append((int(x), int(y)))
-
-        yield TVFrameResult(
-            frame_id=frame_id,
-            boxes=boxes,
-            keypoints=kpts,
+        results.append(
+            TVFrameResult(
+                frame_id=frame_id,
+                boxes=boxes,
+                keypoints=frame_info["keypoints"],
+            )
         )
         frame_id += 1
+
+    t_pass2 = time.perf_counter() - t_pass2_start
+    print(f"[infer] pass2_apply_and_yield: {t_pass2:.3f}s")
+
+    return results
 
 
 def visualize_from_results(
@@ -187,11 +215,6 @@ def visualize_from_results(
     target_video_path: str,
     results: Iterator[TVFrameResult],
 ) -> None:
-    """
-    Visualize from pre-computed TVFrameResult (không chạy lại model).
-    - Vẽ keypoints
-    - Vẽ boxes với cls_id, conf
-    """
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     video_info = sv.VideoInfo.from_video_path(source_video_path)
 
@@ -199,17 +222,15 @@ def visualize_from_results(
         for frame, frame_result in zip(frame_generator, results):
             annotated_frame = frame.copy()
 
-            # Vẽ keypoints
             for x, y in frame_result.keypoints:
                 cv2.circle(annotated_frame, (x, y), radius=4, color=(0, 255, 0), thickness=-1)
 
-            # Vẽ boxes
             for box in frame_result.boxes:
                 color = (0, 0, 255)
                 if box.cls_id == TEAM_1_CLASS_ID:
-                    color = (255, 0, 0)  # team 1
+                    color = (255, 0, 0)
                 elif box.cls_id == TEAM_2_CLASS_ID:
-                    color = (0, 255, 255)  # team 2
+                    color = (0, 255, 255)
 
                 cv2.rectangle(
                     annotated_frame,
@@ -232,12 +253,6 @@ def visualize_from_results(
 
             sink.write_frame(annotated_frame)
 
-            cv2.imshow("infer", annotated_frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-        cv2.destroyAllWindows()
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Soccer inference script (API + CLI)")
@@ -259,51 +274,28 @@ def main() -> None:
         action="store_true",
         help="Enable visualization (if no target_video_path, will auto-generate).",
     )
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument(
-        "--show_radar",
-        action="store_true",
-        help="Overlay a small radar view using keypoints + team positions",
-    )
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    # Nếu dùng như library/API thì gọi trực tiếp run_infer_results(...)
-    # CLI: có thể chọn xuất JSON, visualize video, hoặc cả hai.
-    results_for_visualize: List[TVFrameResult] | None = None
-    if args.visualize:
-        results_for_visualize = []
-
-    # Chạy inference base model trước
     if args.json_output_path is not None or args.visualize:
-        with open(args.json_output_path, "w", encoding="utf-8") if args.json_output_path is not None else None as f:  # type: ignore[assignment]
-            for tv_frame in run_infer_results(
-                source_video_path=args.source_video_path,
-                device=args.device,
-            ):
-                if args.json_output_path is not None and f is not None:
-                    f.write(tv_frame.model_dump_json())
-                    f.write("\n")
-                if results_for_visualize is not None:
-                    results_for_visualize.append(tv_frame)
+        f = open(args.json_output_path, "w", encoding="utf-8") if args.json_output_path is not None else None
+        results_for_visualize = run_infer_results(
+            source_video_path=args.source_video_path,
+            device=args.device,
+        )
+        for tv_frame in results_for_visualize:
+            if f is not None:
+                f.write(tv_frame.model_dump_json())
+                f.write("\n")
+        if f is not None:
+            f.close()
 
-    # Visualization chỉ chạy khi có flag --visualize
     if args.visualize:
-        # Nếu --visualize mà chưa truyền target_video_path
-        # thì tự sinh một tên file mới.
         if args.target_video_path is None:
             base, ext = os.path.splitext(args.source_video_path)
             if not ext:
                 ext = ".mp4"
             args.target_video_path = f"{base}_vis{ext}"
-
-        if results_for_visualize is None:
-            # Trường hợp hiếm: visualize nhưng không collect trước (không nên xảy ra)
-            results_for_visualize = list(
-                run_infer_results(
-                    source_video_path=args.source_video_path,
-                    device=args.device,
-                )
-            )
 
         visualize_from_results(
             source_video_path=args.source_video_path,
@@ -312,13 +304,10 @@ def main() -> None:
         )
 
     if args.json_output_path is None and not args.visualize:
-        # Không output gì -> chỉ chạy thử để check pipeline (không khuyến khích).
-        # Ở đây ta vẫn chạy generator để đảm bảo không lỗi.
-        for _ in run_infer_results(
+        _ = run_infer_results(
             source_video_path=args.source_video_path,
             device=args.device,
-        ):
-            pass
+        )
 
 
 if __name__ == "__main__":

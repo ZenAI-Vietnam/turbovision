@@ -3,14 +3,14 @@ from typing import Generator, Iterable, List, TypeVar
 import numpy as np
 import supervision as sv
 import torch
-import umap
-from sklearn.cluster import KMeans
+from cuml.cluster import KMeans
+from cuml.manifold import UMAP
 from tqdm import tqdm
 from transformers import AutoProcessor, SiglipVisionModel
 
 V = TypeVar("V")
 
-SIGLIP_MODEL_PATH = 'google/siglip-base-patch16-224'
+SIGLIP_MODEL_PATH = "google/siglip-base-patch16-224"
 
 
 def create_batches(
@@ -43,20 +43,24 @@ class TeamClassifier:
     A classifier that uses a pre-trained SiglipVisionModel for feature extraction,
     UMAP for dimensionality reduction, and KMeans for clustering.
     """
-    def __init__(self, device: str = 'cpu', batch_size: int = 32):
-        """
-       Initialize the TeamClassifier with device and batch size.
 
-       Args:
-           device (str): The device to run the model on ('cpu' or 'cuda').
-           batch_size (int): The batch size for processing images.
-       """
+    _features_model: SiglipVisionModel | None = None
+    _processor: AutoProcessor | None = None
+
+    def __init__(self, device: str = "cpu", batch_size: int = 32):
         self.device = device
         self.batch_size = batch_size
-        self.features_model = SiglipVisionModel.from_pretrained(
-            SIGLIP_MODEL_PATH).to(device)
-        self.processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_PATH)
-        self.reducer = umap.UMAP(n_components=3)
+
+        if TeamClassifier._features_model is None or TeamClassifier._processor is None:
+            TeamClassifier._features_model = SiglipVisionModel.from_pretrained(
+                SIGLIP_MODEL_PATH
+            )
+            TeamClassifier._processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_PATH)
+
+        # share global model/processor, chỉ chuyển device nếu cần
+        self.features_model = TeamClassifier._features_model.to(self.device)
+        self.processor = TeamClassifier._processor
+        self.reducer = UMAP(n_components=3)
         self.cluster_model = KMeans(n_clusters=2)
 
     def extract_features(self, crops: List[np.ndarray]) -> np.ndarray:
@@ -109,4 +113,19 @@ class TeamClassifier:
 
         data = self.extract_features(crops)
         projections = self.reducer.transform(data)
-        return self.cluster_model.predict(projections)
+        labels = self.cluster_model.predict(projections)
+        # cuML trả về cupy array, convert sang numpy nếu cần
+        return labels.get() if hasattr(labels, "get") else np.asarray(labels)
+
+    def fit_predict(self, crops: List[np.ndarray]) -> np.ndarray:
+        """
+        Fit on crops and return cluster labels, computing embeddings only once.
+        """
+        if len(crops) == 0:
+            return np.array([])
+
+        data = self.extract_features(crops)
+        projections = self.reducer.fit_transform(data)
+        self.cluster_model.fit(projections)
+        labels = self.cluster_model.labels_
+        return labels.get() if hasattr(labels, "get") else np.asarray(labels)
